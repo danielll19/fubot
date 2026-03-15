@@ -1,3 +1,4 @@
+import json
 import re
 import shutil
 from pathlib import Path
@@ -105,6 +106,72 @@ def test_onboard_existing_workspace_safe_create(mock_paths):
     assert "Created workspace" not in result.stdout
     assert "Created AGENTS.md" in result.stdout
     assert (workspace_dir / "AGENTS.md").exists()
+
+
+def test_onboard_interactive_quickstart_writes_llm_config(tmp_path, monkeypatch):
+    """Interactive onboard should leave behind a usable runtime llm config."""
+    config_path = tmp_path / "config.json"
+    workspace_dir = tmp_path / "workspace"
+
+    monkeypatch.setattr("fubot.config.loader.get_config_path", lambda: config_path)
+    monkeypatch.setattr("fubot.cli.commands.get_workspace_path", lambda: workspace_dir)
+    monkeypatch.setattr("fubot.cli.commands._is_interactive_onboard", lambda: True)
+    monkeypatch.setattr("fubot.cli.commands._verify_onboard_model_connection", lambda _cfg: (True, "OK"))
+
+    result = runner.invoke(
+        app,
+        ["onboard"],
+        input="\ncustom\nhttps://example.com/v1\nsk-test\nexample-model\n\nn\n",
+    )
+
+    assert result.exit_code == 0
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["llm"]["provider"] == "custom"
+    assert saved["llm"]["baseUrl"] == "https://example.com/v1"
+    assert saved["llm"]["apiKey"] == "sk-test"
+    assert saved["llm"]["modelId"] == "example-model"
+    assert saved["agents"]["defaults"]["model"] == "example-model"
+    assert "Connection OK" in result.stdout
+    assert "Config verified" in result.stdout
+
+
+def test_onboard_interactive_channel_quickstart_writes_telegram_config(tmp_path, monkeypatch):
+    """Interactive onboard can configure a chat channel end-to-end."""
+    config_path = tmp_path / "config.json"
+    workspace_dir = tmp_path / "workspace"
+
+    monkeypatch.setattr("fubot.config.loader.get_config_path", lambda: config_path)
+    monkeypatch.setattr("fubot.cli.commands.get_workspace_path", lambda: workspace_dir)
+    monkeypatch.setattr("fubot.cli.commands._is_interactive_onboard", lambda: True)
+
+    result = runner.invoke(
+        app,
+        ["onboard", "--no-verify"],
+        input="\ncustom\nhttps://example.com/v1\nsk-test\nexample-model\ny\ntelegram\n123456:ABCDEF\n*\n",
+    )
+
+    assert result.exit_code == 0
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["channels"]["telegram"]["enabled"] is True
+    assert saved["channels"]["telegram"]["token"] == "123456:ABCDEF"
+    assert saved["channels"]["telegram"]["allowFrom"] == ["*"]
+    assert "Configured Telegram" in result.stdout
+    assert "Configured channels: Telegram" in result.stdout
+
+
+def test_onboard_no_quickstart_keeps_manual_setup_path(tmp_path, monkeypatch):
+    """Users can still opt out of the interactive wizard for scripting or CI."""
+    config_path = tmp_path / "config.json"
+    workspace_dir = tmp_path / "workspace"
+
+    monkeypatch.setattr("fubot.config.loader.get_config_path", lambda: config_path)
+    monkeypatch.setattr("fubot.cli.commands.get_workspace_path", lambda: workspace_dir)
+    monkeypatch.setattr("fubot.cli.commands._is_interactive_onboard", lambda: True)
+
+    result = runner.invoke(app, ["onboard", "--no-quickstart"])
+
+    assert result.exit_code == 0
+    assert "Add your API key" in result.stdout
 
 
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():

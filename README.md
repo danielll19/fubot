@@ -136,7 +136,9 @@ python3 -m pip install -e .[dev]
 fubot onboard
 ```
 
-然后编辑 `~/.fubot/config.json`，至少填写 `llm` 配置。一个最小可运行的 OpenAI 兼容示例：
+在交互式终端里，`fubot onboard` 会进一步引导你填写一个可直接使用的 LLM 配置，并可现场测试连通性。它还可以顺手配置常见聊天渠道的最小必需字段，例如 Telegram、Discord、Slack、WhatsApp、Feishu、DingTalk、QQ、Matrix、WeCom、Email 和 Mochat。
+
+如果你跳过 quickstart，或在非交互环境里执行 `onboard`，则还需要手动编辑 `~/.fubot/config.json`，至少填写 `llm` 配置。一个最小可运行的 OpenAI 兼容示例：
 
 ```json
 {

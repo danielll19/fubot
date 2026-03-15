@@ -117,6 +117,550 @@ def _make_console() -> Console:
     return Console(file=sys.stdout)
 
 
+def _is_interactive_onboard() -> bool:
+    """Return True when onboard is running in a real interactive terminal."""
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _onboard_model_ready(config: Config) -> bool:
+    """Return True when config looks usable for a first chat."""
+    from fubot.providers.registry import find_by_name
+
+    model = config.llm.model_id or config.agents.defaults.model
+    provider_name = config.get_provider_name(model) or ""
+    api_base = config.get_api_base(model)
+    api_key = config.get_api_key(model)
+    spec = find_by_name(provider_name) if provider_name else None
+
+    if provider_name == "custom":
+        return bool(config.llm.base_url and config.llm.model_id)
+    if spec and spec.is_local:
+        return bool(model and api_base)
+    if spec and spec.is_oauth:
+        return True
+    return bool(model and (api_key or api_base))
+
+
+def _prompt_required(prompt_text: str, default: str = "") -> str:
+    """Prompt until a non-empty value is provided."""
+    while True:
+        value = typer.prompt(prompt_text, default=default).strip()
+        if value:
+            return value
+        console.print("[red]This value is required.[/red]")
+
+
+def _prompt_onboard_setup_mode(current: str | None = None) -> str:
+    """Prompt for onboarding setup mode with a small validated choice set."""
+    default = current or "custom"
+    aliases = {
+        "1": "custom",
+        "2": "ollama",
+        "3": "skip",
+        "custom": "custom",
+        "compatible": "custom",
+        "openai": "custom",
+        "ollama": "ollama",
+        "local": "ollama",
+        "skip": "skip",
+    }
+    while True:
+        raw = typer.prompt(
+            "LLM setup mode [custom/ollama/skip]",
+            default=default,
+            show_default=True,
+        ).strip().lower()
+        choice = aliases.get(raw)
+        if choice:
+            return choice
+        console.print("[red]Choose one of: custom, ollama, skip.[/red]")
+
+
+def _collect_onboard_llm_config(config: Config, mode: str) -> None:
+    """Update config with interactive quickstart LLM settings."""
+    if mode == "ollama":
+        base_default = config.llm.base_url if "11434" in (config.llm.base_url or "") else "http://localhost:11434/v1"
+        model_default = config.llm.model_id or "llama3.2"
+        config.llm.provider = "custom"
+        config.llm.base_url = _prompt_required("Ollama OpenAI-compatible base URL", default=base_default)
+        config.llm.api_key = ""
+        config.llm.model_id = _prompt_required("Ollama model name", default=model_default)
+        config.agents.defaults.model = config.llm.model_id
+        return
+
+    config.llm.provider = "custom"
+    base_default = config.llm.base_url or "https://api.openai.com/v1"
+    model_default = config.llm.model_id
+    config.llm.base_url = _prompt_required("OpenAI-compatible base URL", default=base_default)
+
+    current_key = config.llm.api_key or ""
+    key_prompt = "API key (leave blank if not required)"
+    if current_key:
+        entered = typer.prompt(
+            "API key (leave blank to keep current)",
+            default="",
+            hide_input=True,
+            show_default=False,
+        ).strip()
+        config.llm.api_key = entered or current_key
+    else:
+        config.llm.api_key = typer.prompt(
+            key_prompt,
+            default="",
+            hide_input=True,
+            show_default=False,
+        ).strip()
+    config.llm.model_id = _prompt_required("Model ID", default=model_default)
+    config.agents.defaults.model = config.llm.model_id
+
+
+def _verify_onboard_model_connection(config: Config) -> tuple[bool, str]:
+    """Run a tiny model probe to verify quickstart settings."""
+    model = config.llm.model_id or config.agents.defaults.model
+    try:
+        provider = _make_provider(config)
+    except typer.Exit:
+        return False, "provider configuration is incomplete"
+    except Exception as exc:
+        return False, str(exc)
+
+    async def _probe() -> tuple[bool, str]:
+        response = await provider.chat_with_retry(
+            messages=[{"role": "user", "content": "Reply with exactly OK."}],
+            model=model,
+            max_tokens=16,
+            temperature=0,
+        )
+        if response.finish_reason == "error":
+            return False, (response.content or "unknown provider error").strip()
+        preview = (response.content or "").strip().replace("\n", " ")
+        return True, preview or "connected"
+
+    try:
+        return asyncio.run(_probe())
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _maybe_run_onboard_quickstart(config: Config, verify: bool) -> tuple[bool, bool]:
+    """Offer an interactive quickstart so onboard can leave a usable config behind."""
+    if not _is_interactive_onboard():
+        return _onboard_model_ready(config), False
+
+    already_ready = _onboard_model_ready(config)
+    prompt = "Configure LLM now so fubot can be used immediately?"
+    if not typer.confirm(prompt, default=not already_ready):
+        return already_ready, False
+
+    console.print("\n[bold]Quickstart[/bold]")
+    console.print("Configure one model endpoint now so `fubot agent` works without manual config edits.")
+
+    verified = False
+    while True:
+        mode = _prompt_onboard_setup_mode("custom")
+        if mode == "skip":
+            return _onboard_model_ready(config), verified
+
+        _collect_onboard_llm_config(config, mode)
+
+        from fubot.config.loader import save_config
+
+        save_config(config)
+        console.print(f"[green]✓[/green] Saved LLM settings for model [cyan]{config.llm.model_id}[/cyan]")
+
+        if not verify or not typer.confirm("Test model connection now?", default=True):
+            return _onboard_model_ready(config), verified
+
+        console.print("[dim]Testing model connection...[/dim]")
+        ok, detail = _verify_onboard_model_connection(config)
+        if ok:
+            console.print(f"[green]✓[/green] Connection OK: {detail}")
+            return True, True
+
+        console.print(f"[yellow]Connection test failed:[/yellow] {detail}")
+        verified = False
+        if not typer.confirm("Edit LLM settings again?", default=True):
+            return _onboard_model_ready(config), verified
+
+
+_ONBOARD_CHANNEL_ORDER = (
+    "telegram",
+    "discord",
+    "slack",
+    "whatsapp",
+    "feishu",
+    "dingtalk",
+    "qq",
+    "matrix",
+    "wecom",
+    "email",
+    "mochat",
+)
+
+_ONBOARD_CHANNEL_LABELS = {
+    "telegram": "Telegram",
+    "discord": "Discord",
+    "slack": "Slack",
+    "whatsapp": "WhatsApp",
+    "feishu": "Feishu",
+    "dingtalk": "DingTalk",
+    "qq": "QQ",
+    "matrix": "Matrix",
+    "wecom": "WeCom",
+    "email": "Email",
+    "mochat": "Mochat",
+}
+
+_ONBOARD_CHANNEL_DESCRIPTIONS = {
+    "telegram": "bot token + allow_from",
+    "discord": "bot token + allow_from",
+    "slack": "bot token + app token + allow_from",
+    "whatsapp": "bridge URL + allow_from, then QR login",
+    "feishu": "app id + app secret + allow_from",
+    "dingtalk": "client id + client secret + allow_from",
+    "qq": "app id + secret + allow_from",
+    "matrix": "homeserver + access token + user id + allow_from",
+    "wecom": "bot id + secret + allow_from",
+    "email": "IMAP/SMTP mailbox + allow_from + explicit consent",
+    "mochat": "claw token + target auto-discovery + allow_from",
+}
+
+_ONBOARD_CHANNEL_ALIASES = {
+    "telegram": "telegram",
+    "tg": "telegram",
+    "discord": "discord",
+    "slack": "slack",
+    "whatsapp": "whatsapp",
+    "wa": "whatsapp",
+    "feishu": "feishu",
+    "lark": "feishu",
+    "dingtalk": "dingtalk",
+    "dingtalk": "dingtalk",
+    "qq": "qq",
+    "matrix": "matrix",
+    "element": "matrix",
+    "wecom": "wecom",
+    "wechatwork": "wecom",
+    "email": "email",
+    "mail": "email",
+    "mochat": "mochat",
+}
+
+
+def _default_csv(values: list[str] | tuple[str, ...] | None, fallback: str = "") -> str:
+    """Format list values as prompt defaults."""
+    items = [str(v).strip() for v in (values or []) if str(v).strip()]
+    return ",".join(items) if items else fallback
+
+
+def _prompt_optional(prompt_text: str, default: str = "") -> str:
+    """Prompt for an optional free-text value."""
+    return typer.prompt(
+        prompt_text,
+        default=default,
+        show_default=bool(default),
+    ).strip()
+
+
+def _prompt_secret(
+    prompt_text: str,
+    current: str = "",
+    *,
+    required: bool = True,
+) -> str:
+    """Prompt for a secret with optional keep-current behavior."""
+    while True:
+        if current:
+            value = typer.prompt(
+                f"{prompt_text} (leave blank to keep current)",
+                default="",
+                hide_input=True,
+                show_default=False,
+            ).strip()
+            if value:
+                return value
+            if current:
+                return current
+        else:
+            value = typer.prompt(
+                prompt_text,
+                default="",
+                hide_input=True,
+                show_default=False,
+            ).strip()
+            if value or not required:
+                return value
+        console.print("[red]This value is required.[/red]")
+
+
+def _prompt_int(prompt_text: str, default: int) -> int:
+    """Prompt for an integer value."""
+    while True:
+        raw = typer.prompt(prompt_text, default=str(default)).strip()
+        try:
+            return int(raw)
+        except ValueError:
+            console.print("[red]Enter a valid integer.[/red]")
+
+
+def _prompt_csv_values(
+    prompt_text: str,
+    current: list[str] | None = None,
+    *,
+    fallback: str = "",
+    allow_empty: bool = False,
+) -> list[str]:
+    """Prompt for a comma-separated list."""
+    while True:
+        raw = typer.prompt(
+            prompt_text,
+            default=_default_csv(current, fallback),
+            show_default=bool(_default_csv(current, fallback)),
+        ).strip()
+        if not raw:
+            if allow_empty:
+                return []
+            console.print("[red]Enter at least one value.[/red]")
+            continue
+        values = [part.strip() for part in raw.split(",") if part.strip()]
+        if values or allow_empty:
+            return values
+        console.print("[red]Enter at least one value.[/red]")
+
+
+def _prompt_allow_from(channel_name: str, current: list[str] | None = None) -> list[str]:
+    """Prompt for allow_from with a safe default."""
+    return _prompt_csv_values(
+        f"{channel_name} allow_from (comma-separated IDs, usernames, emails, or *)",
+        current=current,
+        fallback="*",
+    )
+
+
+def _prompt_channel_selection() -> list[str]:
+    """Prompt for one or more channel names to configure."""
+    console.print("\n[bold]Available channels[/bold]")
+    for name in _ONBOARD_CHANNEL_ORDER:
+        console.print(f"  - [cyan]{name}[/cyan]: {_ONBOARD_CHANNEL_DESCRIPTIONS[name]}")
+
+    while True:
+        raw = typer.prompt(
+            "Channels to configure (comma-separated names, or none)",
+            default="none",
+            show_default=True,
+        ).strip().lower()
+        if raw in {"", "none", "skip"}:
+            return []
+        if raw == "all":
+            return list(_ONBOARD_CHANNEL_ORDER)
+
+        resolved: list[str] = []
+        unknown: list[str] = []
+        for part in raw.split(","):
+            key = part.strip().lower().replace("-", "").replace("_", "")
+            if not key:
+                continue
+            name = _ONBOARD_CHANNEL_ALIASES.get(key)
+            if not name:
+                unknown.append(part.strip())
+                continue
+            if name not in resolved:
+                resolved.append(name)
+
+        if resolved and not unknown:
+            return resolved
+
+        if unknown:
+            console.print(f"[red]Unknown channels:[/red] {', '.join(unknown)}")
+        else:
+            console.print("[red]Choose at least one valid channel or 'none'.[/red]")
+
+
+def _configure_telegram_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.telegram
+    section.token = _prompt_secret("Telegram bot token", section.token)
+    section.allow_from = _prompt_allow_from("Telegram", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+def _configure_discord_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.discord
+    section.token = _prompt_secret("Discord bot token", section.token)
+    section.allow_from = _prompt_allow_from("Discord", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+def _configure_slack_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.slack
+    section.bot_token = _prompt_secret("Slack bot token (xoxb-...)", section.bot_token)
+    section.app_token = _prompt_secret("Slack app token (xapp-...)", section.app_token)
+    section.allow_from = _prompt_allow_from("Slack", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+def _configure_whatsapp_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.whatsapp
+    section.bridge_url = _prompt_required("WhatsApp bridge URL", section.bridge_url or "ws://localhost:3001")
+    section.bridge_token = _prompt_secret(
+        "WhatsApp bridge token (optional)",
+        section.bridge_token,
+        required=False,
+    )
+    section.allow_from = _prompt_allow_from("WhatsApp", section.allow_from)
+    section.enabled = True
+    return True, ["Run `fubot channels login` once to scan the WhatsApp QR code."]
+
+
+def _configure_feishu_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.feishu
+    section.app_id = _prompt_required("Feishu app id", section.app_id)
+    section.app_secret = _prompt_secret("Feishu app secret", section.app_secret)
+    section.allow_from = _prompt_allow_from("Feishu", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+def _configure_dingtalk_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.dingtalk
+    section.client_id = _prompt_required("DingTalk client id", section.client_id)
+    section.client_secret = _prompt_secret("DingTalk client secret", section.client_secret)
+    section.allow_from = _prompt_allow_from("DingTalk", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+def _configure_qq_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.qq
+    section.app_id = _prompt_required("QQ app id", section.app_id)
+    section.secret = _prompt_secret("QQ app secret", section.secret)
+    section.allow_from = _prompt_allow_from("QQ", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+def _configure_matrix_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.matrix
+    section.homeserver = _prompt_required("Matrix homeserver", section.homeserver or "https://matrix.org")
+    section.access_token = _prompt_secret("Matrix access token", section.access_token)
+    section.user_id = _prompt_required("Matrix user id", section.user_id)
+    section.device_id = _prompt_optional("Matrix device id (optional)", section.device_id)
+    section.allow_from = _prompt_allow_from("Matrix", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+def _configure_wecom_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.wecom
+    section.bot_id = _prompt_required("WeCom bot id", section.bot_id)
+    section.secret = _prompt_secret("WeCom bot secret", section.secret)
+    section.allow_from = _prompt_allow_from("WeCom", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+def _configure_email_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.email
+    consent_default = bool(section.consent_granted)
+    if not typer.confirm(
+        "You have explicit permission to let fubot read and reply from this mailbox?",
+        default=consent_default,
+    ):
+        console.print("[yellow]Skipping Email setup without explicit consent.[/yellow]")
+        return False, []
+
+    section.consent_granted = True
+    section.imap_host = _prompt_required("Email IMAP host", section.imap_host)
+    section.imap_port = _prompt_int("Email IMAP port", section.imap_port)
+    section.imap_username = _prompt_required("Email IMAP username", section.imap_username)
+    section.imap_password = _prompt_secret("Email IMAP password", section.imap_password)
+    section.smtp_host = _prompt_required("Email SMTP host", section.smtp_host)
+    section.smtp_port = _prompt_int("Email SMTP port", section.smtp_port)
+    section.smtp_username = _prompt_required("Email SMTP username", section.smtp_username)
+    section.smtp_password = _prompt_secret("Email SMTP password", section.smtp_password)
+    section.from_address = _prompt_optional(
+        "Email from address (optional, defaults to SMTP username)",
+        section.from_address or section.smtp_username,
+    )
+    section.allow_from = _prompt_allow_from("Email", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+def _configure_mochat_channel(config: Config) -> tuple[bool, list[str]]:
+    section = config.channels.mochat
+    section.base_url = _prompt_required("Mochat base URL", section.base_url or "https://mochat.io")
+    section.socket_url = _prompt_optional("Mochat socket URL (optional)", section.socket_url)
+    section.claw_token = _prompt_secret("Mochat claw token", section.claw_token)
+    section.agent_user_id = _prompt_optional(
+        "Mochat agent user id (optional, improves mention detection)",
+        section.agent_user_id,
+    )
+    section.sessions = _prompt_csv_values(
+        "Mochat sessions to watch (comma-separated IDs, or * for auto-discover)",
+        current=section.sessions,
+        fallback="*",
+    )
+    section.panels = _prompt_csv_values(
+        "Mochat panels to watch (comma-separated IDs, or * for auto-discover)",
+        current=section.panels,
+        fallback="*",
+    )
+    section.allow_from = _prompt_allow_from("Mochat", section.allow_from)
+    section.enabled = True
+    return True, []
+
+
+_ONBOARD_CHANNEL_HANDLERS = {
+    "telegram": _configure_telegram_channel,
+    "discord": _configure_discord_channel,
+    "slack": _configure_slack_channel,
+    "whatsapp": _configure_whatsapp_channel,
+    "feishu": _configure_feishu_channel,
+    "dingtalk": _configure_dingtalk_channel,
+    "qq": _configure_qq_channel,
+    "matrix": _configure_matrix_channel,
+    "wecom": _configure_wecom_channel,
+    "email": _configure_email_channel,
+    "mochat": _configure_mochat_channel,
+}
+
+
+def _maybe_run_onboard_channel_quickstart(config: Config) -> tuple[list[str], list[str]]:
+    """Offer an interactive channel setup flow during onboarding."""
+    if not _is_interactive_onboard():
+        return [], []
+    if not typer.confirm("Configure chat channels now?", default=False):
+        return [], []
+
+    selected = _prompt_channel_selection()
+    if not selected:
+        return [], []
+
+    from fubot.config.loader import save_config
+
+    configured: list[str] = []
+    notes: list[str] = []
+    console.print("\n[bold]Channel Quickstart[/bold]")
+    for name in selected:
+        label = _ONBOARD_CHANNEL_LABELS[name]
+        console.print(f"[dim]Configuring {label}...[/dim]")
+        applied, extra_notes = _ONBOARD_CHANNEL_HANDLERS[name](config)
+        save_config(config)
+        if applied:
+            configured.append(label)
+            console.print(f"[green]✓[/green] Configured {label}")
+        for note in extra_notes:
+            if note not in notes:
+                notes.append(note)
+    return configured, notes
+
+
 def _render_interactive_ansi(render_fn) -> str:
     """Render Rich output to ANSI so prompt_toolkit can print it safely."""
     ansi_console = Console(
@@ -215,7 +759,18 @@ def main(
 
 
 @app.command()
-def onboard():
+def onboard(
+    quickstart: bool = typer.Option(
+        True,
+        "--quickstart/--no-quickstart",
+        help="Prompt for a first-run LLM setup when running interactively.",
+    ),
+    verify: bool = typer.Option(
+        True,
+        "--verify/--no-verify",
+        help="Test the configured model connection during quickstart setup.",
+    ),
+):
     """Initialize fubot configuration and workspace."""
     from fubot.config.loader import get_config_path, load_config, save_config
     from fubot.config.schema import Config
@@ -235,7 +790,8 @@ def onboard():
             save_config(config)
             console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
     else:
-        save_config(Config())
+        config = Config()
+        save_config(config)
         console.print(f"[green]✓[/green] Created config at {config_path}")
 
     console.print("[dim]Config template now uses `maxTokens` + `contextWindowTokens`; `memoryWindow` is no longer a runtime setting.[/dim]")
@@ -249,11 +805,37 @@ def onboard():
 
     sync_workspace_templates(workspace)
 
+    ready = _onboard_model_ready(config)
+    verified = False
+    configured_channels: list[str] = []
+    channel_notes: list[str] = []
+    if quickstart:
+        ready, verified = _maybe_run_onboard_quickstart(config, verify=verify)
+        configured_channels, channel_notes = _maybe_run_onboard_channel_quickstart(config)
+    else:
+        ready = _onboard_model_ready(config)
+
     console.print(f"\n{__logo__} fubot is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.fubot/config.json[/cyan]")
-    console.print("     Get one at: https://openrouter.ai/keys")
-    console.print("  2. Chat: [cyan]fubot agent -m \"Hello!\"[/cyan]")
+    if ready:
+        if verified:
+            console.print("  1. Config verified. Start chatting: [cyan]fubot agent -m \"Hello!\"[/cyan]")
+        else:
+            console.print("  1. Config saved. Start chatting: [cyan]fubot agent -m \"Hello!\"[/cyan]")
+        console.print("  2. Check current setup anytime with: [cyan]fubot status[/cyan]")
+    else:
+        console.print("  1. Add your API key to [cyan]~/.fubot/config.json[/cyan]")
+        console.print("     Get one at: https://openrouter.ai/keys")
+        console.print("  2. Chat: [cyan]fubot agent -m \"Hello!\"[/cyan]")
+
+    if configured_channels:
+        console.print(f"\nConfigured channels: [cyan]{', '.join(configured_channels)}[/cyan]")
+        if ready:
+            console.print("Start the gateway with: [cyan]fubot gateway[/cyan]")
+        else:
+            console.print("After finishing LLM setup, start channels with: [cyan]fubot gateway[/cyan]")
+        for note in channel_notes:
+            console.print(f"  - {note}")
     console.print("\n[dim]Want Telegram/WhatsApp? See README.md for channel setup.[/dim]")
 
 
