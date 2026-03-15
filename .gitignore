@@ -21,4 +21,8 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 botpy.log
+.DS_Store
 
+# Local runtime state and generated workspace data
+/runtime/cron/jobs.json
+/runtime/workspace/
