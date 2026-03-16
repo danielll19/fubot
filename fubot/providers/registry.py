@@ -13,7 +13,29 @@ Every entry writes out all fields so you can copy-paste as a template.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from fubot.config.schema import Config
+
+
+@dataclass(frozen=True)
+class RuntimeProviderConfig:
+    """Minimal provider config shape used for runtime LLM overrides."""
+
+    api_key: str = ""
+    api_base: str | None = None
+    extra_headers: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class ProviderResolution:
+    """Resolved provider selection for one model execution."""
+
+    model: str
+    provider_name: str | None
+    provider_config: RuntimeProviderConfig | Any | None
+    api_base: str | None
 
 
 @dataclass(frozen=True)
@@ -514,9 +536,177 @@ def find_gateway(
     return None
 
 
+def resolve_provider(config: "Config", model: str | None = None, provider_name: str | None = None) -> ProviderResolution:
+    """Resolve the concrete provider configuration for a model execution."""
+    effective_model = model or config.llm.model_id or config.agents.defaults.model
+    requested_provider = provider_name or None
+    model_prefix = effective_model.lower().split("/", 1)[0] if "/" in effective_model else ""
+    normalized_prefix = model_prefix.replace("-", "_")
+
+    if (
+        config.llm.model_id
+        and effective_model == config.llm.model_id
+        and config.llm.base_url
+        and (requested_provider is None or requested_provider == config.llm.provider)
+    ):
+        runtime_provider = RuntimeProviderConfig(
+            api_key=config.llm.api_key,
+            api_base=config.llm.base_url,
+        )
+        return ProviderResolution(
+            model=effective_model,
+            provider_name=config.llm.provider,
+            provider_config=runtime_provider,
+            api_base=config.llm.base_url,
+        )
+
+    if requested_provider:
+        provider_config = getattr(config.providers, requested_provider, None)
+        return ProviderResolution(
+            model=effective_model,
+            provider_name=requested_provider,
+            provider_config=provider_config,
+            api_base=_resolve_api_base(provider_config, requested_provider),
+        )
+
+    forced = config.agents.defaults.provider
+    if forced != "auto":
+        provider_config = getattr(config.providers, forced, None)
+        return ProviderResolution(
+            model=effective_model,
+            provider_name=forced if provider_config else None,
+            provider_config=provider_config,
+            api_base=_resolve_api_base(provider_config, forced if provider_config else None),
+        )
+
+    for spec in PROVIDERS:
+        if model_prefix and normalized_prefix == spec.name:
+            provider_config = getattr(config.providers, spec.name, None)
+            if provider_config and (
+                spec.is_oauth
+                or spec.is_local
+                or getattr(provider_config, "api_key", "")
+                or getattr(provider_config, "api_base", "")
+            ):
+                return ProviderResolution(
+                    model=effective_model,
+                    provider_name=spec.name,
+                    provider_config=provider_config,
+                    api_base=_resolve_api_base(provider_config, spec.name),
+                )
+
+    gateway_spec = find_gateway(
+        api_key=_provider_api_key(config.providers),
+        api_base=_configured_provider_api_base(config.providers),
+    )
+    if gateway_spec:
+        provider_config = getattr(config.providers, gateway_spec.name, None)
+        if provider_config and (
+            gateway_spec.is_oauth
+            or gateway_spec.is_local
+            or getattr(provider_config, "api_key", "")
+            or getattr(provider_config, "api_base", "")
+        ):
+            return ProviderResolution(
+                model=effective_model,
+                provider_name=gateway_spec.name,
+                provider_config=provider_config,
+                api_base=_resolve_api_base(provider_config, gateway_spec.name),
+            )
+
+    direct_match = find_by_model(effective_model)
+    if direct_match:
+        provider_config = getattr(config.providers, direct_match.name, None)
+        if provider_config and (
+            direct_match.is_oauth
+            or direct_match.is_local
+            or getattr(provider_config, "api_key", "")
+            or getattr(provider_config, "api_base", "")
+        ):
+            return ProviderResolution(
+                model=effective_model,
+                provider_name=direct_match.name,
+                provider_config=provider_config,
+                api_base=_resolve_api_base(provider_config, direct_match.name),
+            )
+
+    local_fallback: tuple[Any, str] | None = None
+    for spec in PROVIDERS:
+        if not spec.is_local:
+            continue
+        provider_config = getattr(config.providers, spec.name, None)
+        if not (provider_config and getattr(provider_config, "api_base", None)):
+            continue
+        if spec.detect_by_base_keyword and spec.detect_by_base_keyword in provider_config.api_base:
+            return ProviderResolution(
+                model=effective_model,
+                provider_name=spec.name,
+                provider_config=provider_config,
+                api_base=_resolve_api_base(provider_config, spec.name),
+            )
+        if local_fallback is None:
+            local_fallback = (provider_config, spec.name)
+    if local_fallback:
+        provider_config, local_name = local_fallback
+        return ProviderResolution(
+            model=effective_model,
+            provider_name=local_name,
+            provider_config=provider_config,
+            api_base=_resolve_api_base(provider_config, local_name),
+        )
+
+    for spec in PROVIDERS:
+        if spec.is_oauth:
+            continue
+        provider_config = getattr(config.providers, spec.name, None)
+        if provider_config and getattr(provider_config, "api_key", ""):
+            return ProviderResolution(
+                model=effective_model,
+                provider_name=spec.name,
+                provider_config=provider_config,
+                api_base=_resolve_api_base(provider_config, spec.name),
+            )
+
+    return ProviderResolution(
+        model=effective_model,
+        provider_name=None,
+        provider_config=None,
+        api_base=None,
+    )
+
+
 def find_by_name(name: str) -> ProviderSpec | None:
     """Find a provider spec by config field name, e.g. "dashscope"."""
     for spec in PROVIDERS:
         if spec.name == name:
             return spec
+    return None
+
+
+def _resolve_api_base(provider_config: Any, provider_name: str | None) -> str | None:
+    if provider_config and getattr(provider_config, "api_base", None):
+        return provider_config.api_base
+    if not provider_name:
+        return None
+    spec = find_by_name(provider_name)
+    if spec and (spec.is_gateway or spec.is_local) and spec.default_api_base:
+        return spec.default_api_base
+    return None
+
+
+def _configured_provider_api_base(providers: Any) -> str | None:
+    for spec in PROVIDERS:
+        provider_config = getattr(providers, spec.name, None)
+        api_base = getattr(provider_config, "api_base", None) if provider_config else None
+        if api_base:
+            return api_base
+    return None
+
+
+def _provider_api_key(providers: Any) -> str | None:
+    for spec in PROVIDERS:
+        provider_config = getattr(providers, spec.name, None)
+        api_key = getattr(provider_config, "api_key", None) if provider_config else None
+        if api_key:
+            return api_key
     return None

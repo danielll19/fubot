@@ -57,6 +57,27 @@ def test_save_config_writes_context_window_tokens_but_not_memory_window(tmp_path
     assert "memoryWindow" not in defaults
 
 
+def test_load_config_allows_env_to_override_file(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "model": "from-file",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FUBOT_AGENTS__DEFAULTS__MODEL", "from-env")
+
+    config = load_config(config_path)
+
+    assert config.agents.defaults.model == "from-env"
+
+
 def test_onboard_refresh_rewrites_legacy_config_template(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "config.json"
     workspace = tmp_path / "workspace"

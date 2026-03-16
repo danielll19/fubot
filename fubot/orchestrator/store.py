@@ -6,7 +6,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fubot.orchestrator.models import AssignmentRecord, ExecutionLogRecord, TaskRecord, WorkflowRecord, utc_now
+from fubot.orchestrator.models import (
+    AssignmentRecord,
+    ExecutionLogRecord,
+    ProviderHealthState,
+    TaskRecord,
+    WorkflowRecord,
+    utc_now,
+)
 from fubot.utils.helpers import ensure_dir
 
 
@@ -20,6 +27,15 @@ class WorkflowStore:
     def _workflow_path(self, workflow_id: str) -> Path:
         return self.base_dir / f"{workflow_id}.json"
 
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+
     def save_workflow(
         self,
         workflow: WorkflowRecord,
@@ -32,10 +48,7 @@ class WorkflowStore:
             "tasks": [task.to_dict() for task in tasks],
             "assignments": [assignment.to_dict() for assignment in assignments],
         }
-        self._workflow_path(workflow.id).write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        self._atomic_write_json(self._workflow_path(workflow.id), payload)
 
     def load_workflow(self, workflow_id: str) -> dict[str, Any] | None:
         path = self._workflow_path(workflow_id)
@@ -46,6 +59,8 @@ class WorkflowStore:
     def list_workflows(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         for path in sorted(self.base_dir.glob("*.json")):
+            if path == self.health_path or path.name.endswith("-health.json"):
+                continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
@@ -86,9 +101,42 @@ class WorkflowStore:
         if not self.health_path.exists():
             return {}
         try:
-            return json.loads(self.health_path.read_text(encoding="utf-8"))
+            payload = json.loads(self.health_path.read_text(encoding="utf-8"))
         except Exception:
             return {}
+        if not isinstance(payload, dict):
+            return {}
+        normalized: dict[str, Any] = {}
+        for provider, state in payload.items():
+            if not provider:
+                continue
+            normalized[provider] = ProviderHealthState.from_dict(provider, state).normalized().to_dict()
+        return normalized
 
     def save_health(self, payload: dict[str, Any]) -> None:
-        self.health_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        current = {
+            provider: ProviderHealthState.from_dict(provider, state).normalized()
+            for provider, state in self.load_health().items()
+            if provider
+        }
+        incoming = {
+            provider: ProviderHealthState.from_dict(provider, state).normalized()
+            for provider, state in (payload or {}).items()
+            if provider
+        }
+        merged: dict[str, Any] = {}
+        for provider in sorted(set(current) | set(incoming)):
+            current_state = current.get(provider)
+            incoming_state = incoming.get(provider)
+            if current_state is None and incoming_state is None:
+                continue
+            if current_state is None:
+                final_state = incoming_state
+            elif incoming_state is None:
+                final_state = current_state
+            else:
+                final_state = current_state.merged_with(incoming_state)
+            if final_state is None:
+                continue
+            merged[provider] = final_state.to_dict()
+        self._atomic_write_json(self.health_path, merged)

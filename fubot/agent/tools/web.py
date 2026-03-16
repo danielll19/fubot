@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import html
+import ipaddress
 import json
 import os
 import re
+import socket
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from loguru import logger
@@ -21,6 +23,9 @@ if TYPE_CHECKING:
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
 MAX_REDIRECTS = 5  # Limit redirects to prevent DoS attacks
+MAX_FETCH_BYTES = 1_000_000
+_BLOCKED_HOSTNAMES = {"localhost", "ip6-localhost", "ip6-loopback"}
+_BLOCKED_HOST_SUFFIXES = (".local", ".localdomain", ".localhost", ".internal", ".lan", ".home", ".corp")
 
 
 def _strip_tags(text: str) -> str:
@@ -48,6 +53,72 @@ def _validate_url(url: str) -> tuple[bool, str]:
         return True, ""
     except Exception as e:
         return False, str(e)
+
+
+async def _validate_public_web_url(url: str) -> tuple[bool, str]:
+    """Reject private, loopback, and local-only web targets."""
+    is_valid, error_msg = _validate_url(url)
+    if not is_valid:
+        return False, error_msg
+
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").strip().rstrip(".").lower()
+    if not hostname:
+        return False, "Missing hostname"
+    if hostname in _BLOCKED_HOSTNAMES or hostname.endswith(_BLOCKED_HOST_SUFFIXES):
+        return False, f"Blocked local hostname '{hostname}'"
+
+    try:
+        target = ipaddress.ip_address(hostname)
+        reason = _blocked_ip_reason(target)
+        if reason:
+            return False, reason
+        return True, ""
+    except ValueError:
+        pass
+
+    try:
+        addresses = await _resolve_host_ips(hostname)
+    except OSError as exc:
+        return False, f"DNS resolution failed for '{hostname}': {exc}"
+
+    if not addresses:
+        return False, f"DNS resolution returned no addresses for '{hostname}'"
+
+    for address in addresses:
+        reason = _blocked_ip_reason(address)
+        if reason:
+            return False, reason
+    return True, ""
+
+
+def _blocked_ip_reason(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+    if address.is_private:
+        return f"Blocked private address '{address}'"
+    if address.is_loopback:
+        return f"Blocked loopback address '{address}'"
+    if address.is_link_local:
+        return f"Blocked link-local address '{address}'"
+    if address.is_reserved:
+        return f"Blocked reserved address '{address}'"
+    if address.is_multicast:
+        return f"Blocked multicast address '{address}'"
+    if address.is_unspecified:
+        return f"Blocked unspecified address '{address}'"
+    return None
+
+
+async def _resolve_host_ips(hostname: str) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    def _lookup() -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        resolved: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+        for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM):
+            raw = sockaddr[0]
+            if family == socket.AF_INET6 and "%" in raw:
+                raw = raw.split("%", 1)[0]
+            resolved.add(ipaddress.ip_address(raw))
+        return resolved
+
+    return await asyncio.to_thread(_lookup)
 
 
 def _format_results(query: str, items: list[dict[str, Any]], n: int) -> str:
@@ -83,6 +154,10 @@ class WebSearchTool(Tool):
 
         self.config = config if config is not None else WebSearchConfig()
         self.proxy = proxy
+
+    def execution_mode(self, params: dict[str, Any]) -> str:
+        _ = params
+        return "read_only"
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         provider = self.config.provider.strip().lower() or "brave"
@@ -172,7 +247,7 @@ class WebSearchTool(Tool):
             headers = {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
             async with httpx.AsyncClient(proxy=self.proxy) as client:
                 r = await client.get(
-                    f"https://s.jina.ai/",
+                    "https://s.jina.ai/",
                     params={"q": query},
                     headers=headers,
                     timeout=15.0,
@@ -220,19 +295,31 @@ class WebFetchTool(Tool):
         "required": ["url"],
     }
 
-    def __init__(self, max_chars: int = 50000, proxy: str | None = None):
+    def __init__(self, max_chars: int = 50000, proxy: str | None = None, max_response_bytes: int = MAX_FETCH_BYTES):
         self.max_chars = max_chars
         self.proxy = proxy
+        self.max_response_bytes = max_response_bytes
 
-    async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> str:
-        max_chars = maxChars or self.max_chars
-        is_valid, error_msg = _validate_url(url)
+    def execution_mode(self, params: dict[str, Any]) -> str:
+        _ = params
+        return "read_only"
+
+    async def execute(
+        self,
+        url: str,
+        extract_mode: str = "markdown",
+        max_chars_value: int | None = None,
+        **kwargs: Any,
+    ) -> str:
+        extract_mode = kwargs.get("extractMode", extract_mode)
+        max_chars = kwargs.get("maxChars", max_chars_value) or self.max_chars
+        is_valid, error_msg = await _validate_public_web_url(url)
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
 
         result = await self._fetch_jina(url, max_chars)
         if result is None:
-            result = await self._fetch_readability(url, extractMode, max_chars)
+            result = await self._fetch_readability(url, extract_mode, max_chars)
         return result
 
     async def _fetch_jina(self, url: str, max_chars: int) -> str | None:
@@ -243,17 +330,24 @@ class WebFetchTool(Tool):
             if jina_key:
                 headers["Authorization"] = f"Bearer {jina_key}"
             async with httpx.AsyncClient(proxy=self.proxy, timeout=20.0) as client:
-                r = await client.get(f"https://r.jina.ai/{url}", headers=headers)
-                if r.status_code == 429:
+                async with client.stream("GET", f"https://r.jina.ai/{url}", headers=headers) as response:
+                    if response.status_code == 429:
+                        logger.debug("Jina Reader rate limited, falling back to readability")
+                        return None
+                    response.raise_for_status()
+                    payload = await self._read_response_bytes(response)
+                if response.status_code == 429:
                     logger.debug("Jina Reader rate limited, falling back to readability")
                     return None
-                r.raise_for_status()
-
-            data = r.json().get("data", {})
+            data = json.loads(payload.decode("utf-8", errors="replace")).get("data", {})
             title = data.get("title", "")
             text = data.get("content", "")
             if not text:
                 return None
+            final_url = data.get("url", url)
+            is_valid, error_msg = await _validate_public_web_url(final_url)
+            if not is_valid:
+                return json.dumps({"error": f"URL validation failed: {error_msg}", "url": final_url}, ensure_ascii=False)
 
             if title:
                 text = f"# {title}\n\n{text}"
@@ -262,7 +356,7 @@ class WebFetchTool(Tool):
                 text = text[:max_chars]
 
             return json.dumps({
-                "url": url, "finalUrl": data.get("url", url), "status": r.status_code,
+                "url": url, "finalUrl": final_url, "status": response.status_code,
                 "extractor": "jina", "truncated": truncated, "length": len(text), "text": text,
             }, ensure_ascii=False)
         except Exception as e:
@@ -274,41 +368,95 @@ class WebFetchTool(Tool):
         from readability import Document
 
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True,
-                max_redirects=MAX_REDIRECTS,
-                timeout=30.0,
-                proxy=self.proxy,
-            ) as client:
-                r = await client.get(url, headers={"User-Agent": USER_AGENT})
-                r.raise_for_status()
-
-            ctype = r.headers.get("content-type", "")
+            response_meta, body = await self._fetch_with_redirect_validation(url)
+            ctype = response_meta["headers"].get("content-type", "")
+            text_body = body.decode(response_meta["encoding"] or "utf-8", errors="replace")
 
             if "application/json" in ctype:
-                text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"
-            elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
-                doc = Document(r.text)
+                text, extractor = json.dumps(json.loads(text_body), indent=2, ensure_ascii=False), "json"
+            elif "text/html" in ctype or text_body[:256].lower().startswith(("<!doctype", "<html")):
+                doc = Document(text_body)
                 content = self._to_markdown(doc.summary()) if extract_mode == "markdown" else _strip_tags(doc.summary())
                 text = f"# {doc.title()}\n\n{content}" if doc.title() else content
                 extractor = "readability"
             else:
-                text, extractor = r.text, "raw"
+                text, extractor = text_body, "raw"
 
             truncated = len(text) > max_chars
             if truncated:
                 text = text[:max_chars]
 
             return json.dumps({
-                "url": url, "finalUrl": str(r.url), "status": r.status_code,
+                "url": url, "finalUrl": response_meta["final_url"], "status": response_meta["status_code"],
                 "extractor": extractor, "truncated": truncated, "length": len(text), "text": text,
             }, ensure_ascii=False)
         except httpx.ProxyError as e:
             logger.error("WebFetch proxy error for {}: {}", url, e)
             return json.dumps({"error": f"Proxy error: {e}", "url": url}, ensure_ascii=False)
+        except ValueError as e:
+            logger.warning("WebFetch blocked {}: {}", url, e)
+            return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
         except Exception as e:
             logger.error("WebFetch error for {}: {}", url, e)
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
+
+    async def _fetch_with_redirect_validation(self, url: str) -> tuple[dict[str, Any], bytes]:
+        headers = {"User-Agent": USER_AGENT}
+        current_url = url
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            max_redirects=MAX_REDIRECTS,
+            timeout=30.0,
+            proxy=self.proxy,
+        ) as client:
+            for redirect_index in range(MAX_REDIRECTS + 1):
+                is_valid, error_msg = await _validate_public_web_url(current_url)
+                if not is_valid:
+                    raise ValueError(f"URL validation failed: {error_msg}")
+
+                async with client.stream("GET", current_url, headers=headers) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            response.raise_for_status()
+                        current_url = urljoin(str(response.url), location)
+                        continue
+
+                    response.raise_for_status()
+                    payload = await self._read_response_bytes(response)
+                    return (
+                        {
+                            "status_code": response.status_code,
+                            "final_url": str(response.url),
+                            "headers": response.headers,
+                            "encoding": response.encoding,
+                        },
+                        payload,
+                    )
+
+        raise ValueError(f"Too many redirects while fetching {url}")
+
+    async def _read_response_bytes(self, response: httpx.Response) -> bytes:
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                parsed_length = int(content_length)
+            except ValueError:
+                pass
+            else:
+                if parsed_length > self.max_response_bytes:
+                    raise ValueError(
+                        f"Response body exceeds limit ({self.max_response_bytes} bytes)",
+                    )
+
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > self.max_response_bytes:
+                raise ValueError(f"Response body exceeds limit ({self.max_response_bytes} bytes)")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     def _to_markdown(self, html_content: str) -> str:
         """Convert HTML to markdown."""

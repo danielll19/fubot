@@ -1,51 +1,56 @@
 # fubot
 
-`fubot` 是一个本地优先、面向实际落地的多通道 AI 助手框架。它保留了 CLI 和聊天入口的直接使用体验，同时在内部引入了正式的多代理运行时，由协调器负责任务分派、执行角色选择、模型与 Provider 路由，并将工作流状态持续写入工作区。
+<div align="center">
 
-当前版本已经完成了本地 Agent 框架最核心的一层能力建设，覆盖通道接入、工具调用、记忆管理、定时任务、Provider 接入和工作流编排，适合作为可扩展、可私有化的本地智能体底座。
+本地优先的多通道、多智能体助手框架
 
-## 功能说明
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](./pyproject.toml)
+[![Node.js](https://img.shields.io/badge/Node.js-20%2B-5FA04E?logo=node.js&logoColor=white)](./bridge/package.json)
+[![License](https://img.shields.io/badge/License-MIT-black)](./LICENSE)
 
-### 1. 多代理运行时
+</div>
 
-- 使用 `Coordinator + Executors` 架构处理任务，不再只是单个代理循环。
-- 默认内置 5 类执行角色：
-  - `generalist`：通用任务和用户沟通
-  - `builder`：编码、修改、重构
-  - `researcher`：搜索、证据收集、信息整理
-  - `verifier`：测试、校验、代码审查
-  - `operator`：定时任务、运维和执行型操作
-- 支持任务分类、执行器选择、模型路由、并行执行和最终结果汇总。
+`fubot` 面向希望在本地或私有环境中构建 AI 助手系统的开发者与团队。项目以 Python 为主运行时，提供 CLI、网关服务、多聊天通道接入、工具调用、会话与记忆持久化、多智能体任务编排，以及基于 Provider 健康状态的模型路由与回退能力。
 
-### 2. 工作流与状态持久化
+`fubot` 关注的是一套可以持续运行、可恢复、可审计、可扩展的代理执行底座。
 
-- 保存 workflow、task、assignment、execution log、shared board 和 provider health。
-- 保留追加式会话记录、长期记忆、历史归档和上下文整理能力。
-- 适合需要持续运行、可恢复、可审计的本地 Agent 场景。
+## 项目状态
 
-### 3. 工具能力
+- 当前版本：`0.2.0`
+- 开发状态：Alpha
+- 主要运行时：Python 3.11+
+- 可选桥接层：Node.js 20+（用于 WhatsApp Bridge）
+- 默认本地数据目录：`~/.fubot`
+- 仓库内提供了一份可直接参考的运行时配置：[`runtime/config.json`](./runtime/config.json)
 
-- 文件系统：读写、编辑、列目录
-- Shell：受限执行命令
-- Web：搜索与抓取
-- Message：主动发消息
-- Spawn：后台任务
-- Cron：定时任务
-- MCP：动态工具接入
+## 为什么选择 fubot
 
-这些工具还能按执行角色做权限隔离，不同执行器只拿到自己需要的工具集合。
+- 本地优先。配置、工作区、会话、工作流和长期记忆都保存在本地文件系统中，适合私有化部署和离线运维场景。
+- 入口统一。CLI、定时任务、Heartbeat 和多聊天通道共享同一条消息总线与代理执行链路。
+- 架构清晰。项目将消息接入、任务编排、模型路由、工具执行、状态持久化拆分为明确模块，便于二次开发。
+- 工具可控。文件、Shell、Web、消息、定时任务、后台子代理和 MCP 工具都经过统一注册、校验和权限约束。
+- 路由可审计。每个任务的执行器、模型、Provider、回退链路和执行日志都会写入工作区，便于问题追踪。
+- 适合长期运行。内置会话管理、记忆整理、定时任务、心跳唤醒和任务取消/重启机制，适合常驻型智能体服务。
 
-### 4. 多模型与多 Provider
+## 核心能力
 
-- 支持 OpenAI 兼容接口直连
-- 支持 LiteLLM 路由多 Provider
-- 支持 Azure OpenAI
-- 支持 OAuth 类 Provider
-- 支持按任务动态选择模型，并结合健康缓存做回退
+### 1. 多智能体运行时
 
-### 5. 多通道接入
+项目默认启用 `Coordinator + Executors` 架构。协调器会先对用户输入做任务分类，再为任务挑选执行器与模型路由策略。
 
-当前仓库内已实现或保留的通道包括：
+当前内置的执行角色包括：
+
+- `generalist`：通用问答、写作、沟通类任务
+- `builder`：编码、修改、重构类任务
+- `researcher`：检索、调研、信息收集类任务
+- `verifier`：测试、校验、审查类任务
+- `operator`：定时、运维、执行型任务
+
+在编码、调研、审查、测试等任务上，运行时支持按配置并行分派多个执行器，并在最后合成统一结果。
+
+### 2. 多通道消息接入
+
+仓库当前已经实现的通道模块包括：
 
 - Telegram
 - Discord
@@ -59,86 +64,172 @@
 - Mochat
 - Email
 
-### 6. 技能系统
+所有通道都通过统一的 `MessageBus` 与代理核心解耦。通道的接入、发送、权限校验和消息转发都通过同一套抽象完成；不同通道只需要实现自己的 `BaseChannel` 子类即可。
 
-- 支持技能目录、`SKILL.md`、frontmatter 元数据
-- 已内置 `github`、`weather`、`summarize`、`tmux`、`clawhub`、`skill-creator`、`memory`、`cron` 等技能
-- 可按需扩展本地技能
+说明：部分通道需要额外依赖、平台凭据或外部桥接服务后才能启用。
 
-## 当前已实现的功能
+### 3. 工具系统
 
-结合当前仓库代码、测试和运行时配置，`fubot` 目前已经实现的核心能力包括：
+当前内置工具覆盖：
 
-- CLI 单次执行与交互模式
-- Gateway 常驻运行模式
-- 多通道消息接入与主动消息发送
-- 文件系统、Shell、Web、Cron、Spawn、MCP 等工具能力
-- 追加式会话、长期记忆、历史归档与上下文整理
-- 多 Provider 接入与模型回退
-- 工作流状态持久化与执行日志保存
-- 技能系统与本地技能扩展
+- 文件系统：`read_file`、`write_file`、`edit_file`、`list_dir`
+- Shell：`exec`
+- Web：`web_search`、`web_fetch`
+- 主动消息：`message`
+- 后台子代理：`spawn`
+- 定时任务：`cron`
+- MCP：按配置动态挂载为 `mcp_<server>_<tool>`
 
-如果按 OpenClaw 官方当前已经公开实现的功能来对照，`fubot` 目前已经覆盖了下面这些同类能力：
+工具在运行时按执行角色注入，支持参数校验、只读/副作用执行模式区分，以及副作用工具的回放保护。
+MCP 连接方式同时支持 `stdio`、`SSE` 和 `streamable HTTP`。
 
-| 功能类别 | OpenClaw | `fubot` |
-| --- | --- | --- |
-| CLI / Gateway | 有 `gateway`、`agent`、wizard、doctor 等命令面 | 已实现 `onboard`、`agent`、`gateway`、`status`、`channels status`、`provider login` |
-| 多聊天通道 | 覆盖 WhatsApp、Telegram、Slack、Discord、Matrix、Feishu 等大量通道 | 已实现 Telegram、Discord、Slack、WhatsApp、飞书、钉钉、QQ、企业微信、Matrix、Mochat、Email |
-| 技能系统 | 已有 skills、bundled/workspace skills | 已实现技能目录、`SKILL.md`、frontmatter 元数据与内置技能 |
-| 定时与自动化 | 已有 cron、wakeups、webhooks 等 | 已实现 cron、heartbeat、后台任务、重启与取消 |
-| 会话与状态 | 已有 sessions、presence、config、cron 等网关状态面 | 已实现 append-only session、memory、workflow、provider health 持久化 |
-| 工具能力 | 已有 browser、canvas、nodes、cron、sessions、聊天平台动作等工具 | 已实现 filesystem、shell、web、message、spawn、cron、MCP |
-| 模型与容错 | 已有 models、model failover、retry policy | 已实现 provider 路由、模型回退、健康缓存、重试逻辑 |
+### 4. Provider 与模型路由
 
-## 多 Agent 架构
+项目支持三类模型接入方式：
 
-`fubot` 的核心不是单代理循环，而是一个正式的多 agent 运行时：
+- 直接连接 OpenAI 兼容接口：`custom`
+- 通过 LiteLLM 接入多家 Provider
+- OAuth Provider：如 `openai_codex`、`github_copilot`
 
-- `Coordinator` 负责识别任务类型、选择执行器并创建 workflow
-- `Executors` 负责实际执行任务，每个执行器都有独立角色和工具权限
-- `Router` 负责按任务和模型健康状态选择模型与 Provider
-- `WorkflowStore` 负责保存 workflow、task、assignment、execution log、shared board 和 provider health
+当前配置层已内置 `anthropic`、`openai`、`openrouter`、`deepseek`、`groq`、`dashscope`、`gemini`、`moonshot`、`ollama`、`vllm`、`azure_openai`、`aihubmix`、`siliconflow`、`volcengine`、`byteplus` 等 Provider 元数据。运行时会结合模型名、显式 Provider 指定、健康缓存和冷却窗口决定最终路由，并在必要时触发回退。
 
-默认内置 5 个执行角色：
+### 5. 会话、记忆与工作流持久化
 
-- `generalist`：通用任务和用户沟通
-- `builder`：编码、修改、重构
-- `researcher`：搜索、信息整理、证据收集
-- `verifier`：测试、校验、代码审查
-- `operator`：定时任务、运维和执行型操作
+项目使用多层持久化方案：
 
-这套结构的重点是把“调度”和“执行”拆开，让不同类型任务在不同角色下运行，并且把状态、日志和路由决策保留下来。
+- 会话历史：按 `JSONL` 追加写入，保存在工作区 `sessions/`
+- 长期记忆：保存在 `memory/MEMORY.md`
+- 历史摘要：保存在 `memory/HISTORY.md`
+- 工作流状态：按工作流写入 `workflows/*.json`
+- Provider 健康缓存：写入 `workflows/provider-health.json`
+- 定时任务：写入运行时 `cron/jobs.json`
 
-## 安装方法
+这种设计保证了系统在重启后仍可恢复关键上下文，同时保留完整的执行审计信息。
 
-### 方式一：本地安装（推荐）
+### 6. 自动化能力
 
-要求：
+- `CronService` 支持一次性、固定间隔和标准 Cron 表达式三类调度方式
+- `HeartbeatService` 周期读取 `HEARTBEAT.md`，决定是否唤醒代理执行任务
+- 代理支持 `/stop` 取消当前任务、`/restart` 原地重启进程
+- `spawn` 工具可以启动后台子代理，并继承父级路由信息
 
-- Python 3.11+
+## 快速开始
+
+### 环境要求
+
+- Python 3.11 或更高版本
 - `pip`
+- 可选：Node.js 20 或更高版本（仅在使用 WhatsApp Bridge 时需要）
 
-安装：
+### 安装
 
-```bash
-python3 -m pip install -e .
-```
-
-如果你需要开发依赖：
+安装基础运行时：
 
 ```bash
-python3 -m pip install -e .[dev]
+python -m pip install -e .
 ```
 
-初始化配置与工作区：
+安装开发依赖：
+
+```bash
+python -m pip install -e .[dev]
+```
+
+如果需要对应通道的额外依赖，也可以按需安装：
+
+```bash
+python -m pip install -e .[matrix]
+python -m pip install -e .[wecom]
+```
+
+### 初始化
+
+执行首次初始化：
 
 ```bash
 fubot onboard
 ```
 
-在交互式终端里，`fubot onboard` 会进一步引导你填写一个可直接使用的 LLM 配置，并可现场测试连通性。它还可以顺手配置常见聊天渠道的最小必需字段，例如 Telegram、Discord、Slack、WhatsApp、Feishu、DingTalk、QQ、Matrix、WeCom、Email 和 Mochat。
+该命令会完成以下工作：
 
-如果你跳过 quickstart，或在非交互环境里执行 `onboard`，则还需要手动编辑 `~/.fubot/config.json`，至少填写 `llm` 配置。一个最小可运行的 OpenAI 兼容示例：
+1. 在 `~/.fubot/config.json` 创建或刷新配置文件
+2. 在 `~/.fubot/workspace` 创建默认工作区
+3. 同步工作区模板文件，例如 `AGENTS.md`、`SOUL.md`、`USER.md`、`TOOLS.md`、`HEARTBEAT.md`
+4. 在交互式环境下引导配置 LLM 与常见聊天通道
+
+### 第一次运行
+
+单次执行：
+
+```bash
+fubot agent -m "请总结当前项目的结构"
+```
+
+交互模式：
+
+```bash
+fubot agent
+```
+
+指定仓库内配置运行：
+
+```bash
+fubot agent -c runtime/config.json -m "你好"
+```
+
+启动网关：
+
+```bash
+fubot gateway -c runtime/config.json
+```
+
+查看状态：
+
+```bash
+fubot status
+fubot channels status
+```
+
+### Docker
+
+构建镜像：
+
+```bash
+docker build -t fubot .
+```
+
+使用 Compose 启动网关：
+
+```bash
+docker compose up fubot-gateway
+```
+
+## 常用命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `fubot onboard` | 初始化配置和工作区 |
+| `fubot agent` | 启动交互式 CLI |
+| `fubot agent -m "..."` | 单次执行消息 |
+| `fubot gateway` | 启动常驻网关，接管通道、定时任务和 Heartbeat |
+| `fubot status` | 查看配置、工作区与 Provider 状态 |
+| `fubot channels status` | 查看通道启用情况 |
+| `fubot channels login` | 启动 WhatsApp Bridge 并扫描二维码登录 |
+| `fubot provider login openai-codex` | 启动 OpenAI Codex OAuth 登录 |
+| `fubot provider login github-copilot` | 启动 GitHub Copilot 登录 |
+
+会话内可用的斜杠命令包括：
+
+- `/new`：归档当前会话并开始新会话
+- `/help`：查看可用命令
+- `/stop`：停止当前会话中的活跃任务
+- `/restart`：重启当前 `fubot` 进程
+
+## 配置说明
+
+### 最小 LLM 配置
+
+如果使用 OpenAI 兼容接口，最小配置可以写成：
 
 ```json
 {
@@ -147,72 +238,198 @@ fubot onboard
     "baseUrl": "https://your-openai-compatible-endpoint/v1",
     "apiKey": "YOUR_API_KEY",
     "modelId": "YOUR_MODEL_ID"
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "~/.fubot/workspace",
+      "contextWindowTokens": 65536,
+      "maxToolIterations": 40
+    }
+  },
+  "tools": {
+    "restrictToWorkspace": true
   }
 }
 ```
 
-### 方式二：使用仓库内的运行时配置
+### 配置约定
 
-仓库中带有一个可直接传入的运行时配置文件：
+- 配置模型基于 `Pydantic`，兼容 `camelCase` 和 `snake_case`
+- 环境变量覆盖前缀为 `FUBOT_`
+- 工作区默认路径为 `~/.fubot/workspace`
+- 当 `tools.restrictToWorkspace=true` 时，文件与 Shell 工具会收紧到工作区范围
+- 生产环境中，所有聊天通道都应显式设置 `allowFrom`
 
-```bash
-fubot agent -c runtime/config.json -m "你好"
+### 仓库内示例配置
+
+[`runtime/config.json`](./runtime/config.json) 提供了一个适合本仓库直接运行的示例：
+
+- LLM 入口为 OpenAI 兼容接口
+- 工作区指向 `runtime/workspace`
+- 默认启用 `restrictToWorkspace`
+
+这份配置适合作为本地调试起点，不建议直接带着默认密钥占位投入生产。
+
+## 工作方式
+
+`fubot` 的一次完整执行大致分为以下几个阶段：
+
+1. 通道或 CLI 将消息写入 `MessageBus`
+2. `AgentLoop` 读取消息，加载会话历史、长期记忆、模板上下文和技能摘要
+3. `CoordinatorRuntime` 对任务做分类，并挑选适合的执行器
+4. `RoutePlanner` 选择模型与 Provider，并生成可审计的路由决策
+5. 执行器使用隔离的 `ToolRegistry` 调用工具、访问模型、产出结果
+6. 结果与执行日志写入 `WorkflowStore`
+7. `SessionManager` 持久化对话历史，`MemoryConsolidator` 按 token 压力整理记忆
+8. 网关将最终结果回送到 CLI 或聊天通道
+
+下面的示意图概括了主链路：
+
+```mermaid
+flowchart LR
+    U[CLI / Channels] --> B[MessageBus]
+    B --> L[AgentLoop]
+    L --> C[CoordinatorRuntime]
+    C --> R[RoutePlanner]
+    C --> E[Executors]
+    E --> T[ToolRegistry]
+    E --> P[LLM Providers]
+    L --> S[SessionManager]
+    L --> M[MemoryConsolidator]
+    C --> W[WorkflowStore]
+    G[Gateway / Cron / Heartbeat] --> L
+    WA[WhatsApp Bridge] --> B
 ```
 
-如果你使用这份配置，建议先检查并替换里面的模型连接信息，再投入正式使用。
+## 实现方案
 
-### 方式三：Docker
+### 整体架构
 
-```bash
-docker build -t fubot .
-docker compose up fubot-gateway
+| 模块 | 作用 | 关键实现 |
+| --- | --- | --- |
+| `fubot/cli` | 命令行入口与交互式会话 | `Typer`、`prompt_toolkit`、`rich` |
+| `fubot/channels` | 聊天通道抽象与平台适配 | `BaseChannel`、`ChannelManager` |
+| `fubot/bus` | 消息总线 | 基于 `asyncio.Queue` 的入站/出站队列 |
+| `fubot/agent` | 上下文构建、主循环、子代理、工具装配 | `AgentLoop`、`ContextBuilder`、`SubagentManager` |
+| `fubot/orchestrator` | 多智能体编排与模型路由 | `CoordinatorRuntime`、`RoutePlanner`、`WorkflowStore` |
+| `fubot/providers` | 模型 Provider 抽象与适配 | `CustomProvider`、`LiteLLMProvider`、`AzureOpenAIProvider` |
+| `fubot/session` | 会话持久化 | 追加式 `JSONL` |
+| `fubot/cron` | 定时任务服务 | `CronService` |
+| `fubot/heartbeat` | 心跳唤醒执行 | `HeartbeatService` |
+| `bridge/` | WhatsApp Node.js Bridge | `ws` + `Baileys` |
+
+### 多智能体编排
+
+编排层不是简单地把一次用户输入直接送给单个模型，而是先做任务分类，再基于配置决定：
+
+- 是否启用多执行器
+- 哪些角色有资格参与当前任务
+- 每个角色可用哪些工具
+- 模型与 Provider 应如何选择
+- Provider 失败后是否允许降级或切换
+
+路由决策会保留 `trace_id`、父子路由关系、回退链、尝试次数和健康分数，便于问题审计。
+
+### 工具执行与安全边界
+
+工具系统围绕统一的 `Tool` 抽象展开，主要安全策略包括：
+
+- 文件工具阻止路径穿越，并可限制在工作区内
+- Shell 工具内置危险命令模式拦截
+- Web 抓取会阻止访问私有地址、回环地址和本地域名，避免 SSRF
+- 副作用工具支持基于幂等键的回放保护
+- MCP 工具要求显式注册，并设置超时
+
+这意味着 `fubot` 既能执行复杂任务，也保留了相对可控的运行边界。
+
+### 上下文与记忆
+
+上下文构建由以下几个部分组成：
+
+- 运行时身份信息
+- 工作区模板文件：`AGENTS.md`、`SOUL.md`、`USER.md`、`TOOLS.md`
+- 长期记忆：`memory/MEMORY.md`
+- 技能摘要与按需加载的 `SKILL.md`
+- 会话中的追加式消息历史
+
+当上下文长度逼近上限时，系统会触发记忆整理逻辑，将旧消息归档到 `MEMORY.md` 和 `HISTORY.md`，而不是直接篡改会话原始记录。
+
+### 多通道与 Bridge 方案
+
+多通道能力采用“统一消息总线 + 平台适配器”模式：
+
+- 各通道负责平台协议、登录态和格式转换
+- 通道层统一把入站消息转成 `InboundMessage`
+- 代理层统一把结果转成 `OutboundMessage`
+- WhatsApp 通过独立的 Node.js Bridge 对接，Bridge 默认仅绑定 `127.0.0.1`
+
+这使得 Python 核心运行时与第三方聊天协议实现保持解耦。
+
+## 项目结构
+
+```text
+.
+├── bridge/                 # WhatsApp Node.js bridge
+├── fubot/
+│   ├── agent/              # 主循环、上下文、子代理、工具集成
+│   ├── bus/                # 消息总线
+│   ├── channels/           # 各聊天通道实现
+│   ├── cli/                # Typer CLI
+│   ├── config/             # 配置模型、加载与路径解析
+│   ├── cron/               # 定时任务
+│   ├── heartbeat/          # 心跳服务
+│   ├── orchestrator/       # 多智能体编排与路由
+│   ├── providers/          # 模型 Provider 抽象与实现
+│   ├── session/            # 会话管理
+│   ├── skills/             # 内置技能
+│   └── templates/          # 工作区模板
+├── runtime/                # 仓库内示例运行配置
+├── tests/                  # 测试
+├── COMMUNICATION.md        # 协作与评审约定
+├── SECURITY.md             # 安全建议
+└── pyproject.toml          # Python 项目配置
 ```
 
-## 使用方法
+## 开发与测试
 
-### 1. 单次执行
-
-```bash
-fubot agent -m "帮我总结一下当前目录的项目结构"
-```
-
-### 2. 交互模式
+安装开发依赖后，可直接运行测试：
 
 ```bash
-fubot agent
+pytest
 ```
 
-### 3. 指定配置文件
+建议至少覆盖以下回归面：
+
+- 编排与模型路由
+- 通道接入与权限语义
+- 工具调用与副作用回放保护
+- Cron、Heartbeat 与重启/停止命令
+- Provider 重试与回退逻辑
+
+仓库还提供了一个 Docker 自检脚本：
 
 ```bash
-fubot agent -c runtime/config.json
+bash tests/test_docker.sh
 ```
 
-### 4. 启动 Gateway
+## 安全建议
 
-```bash
-fubot gateway -c runtime/config.json
-```
+在生产环境部署前，建议至少确认以下几点：
 
-Gateway 适合接入聊天通道、定时任务、Heartbeat 和持续运行场景。
+- 不要把密钥写入源码；优先放在配置文件或环境变量中
+- 为所有通道配置 `allowFrom`
+- 尽量启用 `restrictToWorkspace=true`
+- 不要将 Bridge 暴露到公网
+- Email 通道必须在明确授权前提下使用
 
-### 5. 查看状态
+更详细的安全说明见 [`SECURITY.md`](./SECURITY.md)。
 
-```bash
-fubot status
-fubot channels status
-```
+## 相关文档
 
-### 6. Provider 登录
+- [`SECURITY.md`](./SECURITY.md)：运行安全策略与事件处置建议
+- [`COMMUNICATION.md`](./COMMUNICATION.md)：代码协作与评审约定
+- [`fubot/skills/README.md`](./fubot/skills/README.md)：内置技能说明
 
-适用于 OAuth 类 Provider：
+## License
 
-```bash
-fubot provider login openai-codex
-```
-
-### 7. 常见使用路径
-
-- 想本地对话：`fubot onboard` -> 配置 `~/.fubot/config.json` -> `fubot agent`
-- 想做自动运行或多通道接入：配置通道 -> `fubot gateway`
-- 想做代码、搜索、定时任务混合场景：直接使用默认多代理运行时即可
+本项目基于 [MIT License](./LICENSE) 开源。

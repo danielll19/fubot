@@ -134,6 +134,45 @@ def test_exec_guard_blocks_quoted_home_path_outside_workspace(tmp_path) -> None:
     assert error == "Error: Command blocked by safety guard (path outside working dir)"
 
 
+def test_exec_guard_blocks_symlink_escape(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+
+    tool = ExecTool(restrict_to_workspace=True, working_dir=str(workspace))
+    error = tool._guard_command("cat escape/secret.txt", str(workspace))
+
+    assert error == "Error: Command blocked by safety guard (path outside working dir)"
+
+
+def test_exec_guard_blocks_relative_parent_escape(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    child = workspace / "child"
+    workspace.mkdir()
+    child.mkdir()
+
+    tool = ExecTool(restrict_to_workspace=True, working_dir=str(workspace))
+    error = tool._guard_command("cat ../secret.txt", str(child))
+
+    assert error == "Error: Command blocked by safety guard (path traversal detected)"
+
+
+def test_exec_guard_blocks_inline_scripts_when_workspace_restricted(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    tool = ExecTool(restrict_to_workspace=True, working_dir=str(workspace))
+    error = tool._guard_command('python3 -c "print(1)"', str(workspace))
+
+    assert error == (
+        "Error: Command blocked by safety guard "
+        "(inline script execution is disabled with workspace restriction)"
+    )
+
+
 # --- cast_params tests ---
 
 

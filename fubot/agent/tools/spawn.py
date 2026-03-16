@@ -6,6 +6,7 @@ from fubot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
     from fubot.agent.subagent import SubagentManager
+    from fubot.orchestrator.models import RouteDecision
 
 
 class SpawnTool(Tool):
@@ -16,12 +17,19 @@ class SpawnTool(Tool):
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
         self._session_key = "cli:direct"
+        self._route_decision: RouteDecision | None = None
 
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(
+        self,
+        channel: str,
+        chat_id: str,
+        route_decision: "RouteDecision | None" = None,
+    ) -> None:
         """Set the origin context for subagent announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
         self._session_key = f"{channel}:{chat_id}"
+        self._route_decision = route_decision
 
     @property
     def name(self) -> str:
@@ -60,4 +68,6 @@ class SpawnTool(Tool):
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
+            parent_route_decision=self._route_decision,
+            parent_execution_context=kwargs.get("_tool_execution_context"),
         )

@@ -21,8 +21,8 @@ def _make_loop():
 
     with patch("fubot.agent.loop.ContextBuilder"), \
          patch("fubot.agent.loop.SessionManager"), \
-         patch("fubot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("fubot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
     return loop, bus
 
@@ -194,7 +194,8 @@ class TestSubagentCancellation:
         provider.chat_with_retry = scripted_chat_with_retry
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
 
-        async def fake_execute(self, name, arguments):
+        async def fake_execute(self, name, arguments, execution_context=None):
+            _ = execution_context
             return "tool result"
 
         monkeypatch.setattr("fubot.agent.tools.registry.ToolRegistry.execute", fake_execute)

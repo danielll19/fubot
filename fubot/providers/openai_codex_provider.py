@@ -8,7 +8,6 @@ import json
 from typing import Any, AsyncGenerator
 
 import httpx
-from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
 from fubot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -62,13 +61,7 @@ class OpenAICodexProvider(LLMProvider):
         url = DEFAULT_CODEX_URL
 
         try:
-            try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
-            except Exception as e:
-                if "CERTIFICATE_VERIFY_FAILED" not in str(e):
-                    raise
-                logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
+            content, tool_calls, finish_reason = await _request_codex(url, headers, body)
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
@@ -106,9 +99,8 @@ async def _request_codex(
     url: str,
     headers: dict[str, str],
     body: dict[str, Any],
-    verify: bool,
 ) -> tuple[str, list[ToolCallRequest], str]:
-    async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
@@ -232,7 +224,7 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                data_lines = [line[5:].strip() for line in buffer if line.startswith("data:")]
                 buffer = []
                 if not data_lines:
                     continue

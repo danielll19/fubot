@@ -5,22 +5,18 @@ from pathlib import Path
 from typing import Any
 
 from fubot.agent.tools.base import Tool
+from fubot.agent.tools.path_safety import resolve_within_directory
 
 
 def _resolve_path(
     path: str, workspace: Path | None = None, allowed_dir: Path | None = None
 ) -> Path:
     """Resolve path against workspace (if relative) and enforce directory restriction."""
-    p = Path(path).expanduser()
-    if not p.is_absolute() and workspace:
-        p = workspace / p
-    resolved = p.resolve()
-    if allowed_dir:
-        try:
-            resolved.relative_to(allowed_dir.resolve())
-        except ValueError:
-            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
-    return resolved
+    return resolve_within_directory(
+        path,
+        base_dir=workspace,
+        allowed_dir=allowed_dir,
+    )
 
 
 class _FsTool(Tool):
@@ -54,6 +50,10 @@ class ReadFileTool(_FsTool):
             "Read the contents of a file. Returns numbered lines. "
             "Use offset and limit to paginate through large files."
         )
+
+    def execution_mode(self, params: dict[str, Any]) -> str:
+        _ = params
+        return "read_only"
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -173,13 +173,13 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
     old_lines = old_text.splitlines()
     if not old_lines:
         return None, 0
-    stripped_old = [l.strip() for l in old_lines]
+    stripped_old = [line.strip() for line in old_lines]
     content_lines = content.splitlines()
 
     candidates = []
     for i in range(len(content_lines) - len(stripped_old) + 1):
         window = content_lines[i : i + len(stripped_old)]
-        if [l.strip() for l in window] == stripped_old:
+        if [line.strip() for line in window] == stripped_old:
             candidates.append("\n".join(window))
 
     if candidates:
@@ -300,6 +300,10 @@ class ListDirTool(_FsTool):
             "Set recursive=true to explore nested structure. "
             "Common noise directories (.git, node_modules, __pycache__, etc.) are auto-ignored."
         )
+
+    def execution_mode(self, params: dict[str, Any]) -> str:
+        _ = params
+        return "read_only"
 
     @property
     def parameters(self) -> dict[str, Any]:

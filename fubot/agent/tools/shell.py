@@ -3,10 +3,12 @@
 import asyncio
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
 from fubot.agent.tools.base import Tool
+from fubot.agent.tools.path_safety import resolve_user_path, resolve_within_directory
 
 
 class ExecTool(Tool):
@@ -158,20 +160,43 @@ class ExecTool(Tool):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
         if self.restrict_to_workspace:
-            if "..\\" in cmd or "../" in cmd:
-                return "Error: Command blocked by safety guard (path traversal detected)"
+            if re.search(r"\b(?:python|python3|node|ruby|perl|php|bash|sh)\b\s+(?:-c|-e|-r)\b", lower):
+                return "Error: Command blocked by safety guard (inline script execution is disabled with workspace restriction)"
+            try:
+                cwd_path = resolve_within_directory(
+                    cwd,
+                    allowed_dir=Path(self.working_dir or cwd),
+                    label="Working directory",
+                )
+            except PermissionError:
+                return "Error: Command blocked by safety guard (invalid working dir)"
 
-            cwd_path = Path(cwd).resolve()
+            path_error = self._guard_workspace_paths(cmd, cwd_path)
+            if path_error:
+                return path_error
 
-            for raw in self._extract_absolute_paths(cmd):
-                try:
-                    expanded = os.path.expandvars(raw.strip())
-                    p = Path(expanded).expanduser().resolve()
-                except Exception:
-                    continue
-                if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
-                    return "Error: Command blocked by safety guard (path outside working dir)"
+        return None
 
+    def _guard_workspace_paths(self, command: str, cwd_path: Path) -> str | None:
+        """Resolve referenced paths and block workspace escapes."""
+        if "..\\" in command or "../" in command:
+            return "Error: Command blocked by safety guard (path traversal detected)"
+
+        candidates = set(self._extract_absolute_paths(command))
+        for token in self._extract_path_tokens(command, cwd_path):
+            candidates.add(token)
+
+        for raw in candidates:
+            try:
+                resolve_within_directory(
+                    raw,
+                    base_dir=cwd_path,
+                    allowed_dir=Path(self.working_dir or cwd_path),
+                )
+            except PermissionError:
+                return "Error: Command blocked by safety guard (path outside working dir)"
+            except Exception:
+                continue
         return None
 
     @staticmethod
@@ -180,3 +205,29 @@ class ExecTool(Tool):
         posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
         home_paths = re.findall(r"(?:^|[\s|>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
         return win_paths + posix_paths + home_paths
+
+    @staticmethod
+    def _extract_path_tokens(command: str, cwd_path: Path) -> list[str]:
+        try:
+            tokens = shlex.split(command, posix=os.name != "nt")
+        except ValueError:
+            return []
+
+        candidates: list[str] = []
+        for index, token in enumerate(tokens):
+            if index == 0 or not token or token.startswith("-") or "=" in token.split(os.sep, 1)[0]:
+                continue
+            if token in {"|", "&&", "||", ";"}:
+                continue
+            if (
+                "/" in token
+                or "\\" in token
+                or token.startswith(("~", "."))
+                or (cwd_path / token).exists()
+            ):
+                candidates.append(token)
+                continue
+            resolved = resolve_user_path(token, base_dir=cwd_path)
+            if resolved.exists():
+                candidates.append(token)
+        return candidates

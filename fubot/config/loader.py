@@ -2,9 +2,11 @@
 
 import json
 from pathlib import Path
+from typing import Any
+
+from pydantic_settings import EnvSettingsSource
 
 from fubot.config.schema import Config
-
 
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
@@ -39,8 +41,12 @@ def load_config(config_path: Path | None = None) -> Config:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            data = _migrate_config(data)
-            return Config.model_validate(data)
+            file_config = Config.model_validate(_migrate_config(data))
+            env_overrides = _load_env_overrides()
+            if env_overrides:
+                merged = _deep_merge(file_config.model_dump(mode="python"), env_overrides)
+                return Config.model_validate(merged)
+            return file_config
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
@@ -73,3 +79,19 @@ def _migrate_config(data: dict) -> dict:
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
     return data
+
+
+def _load_env_overrides() -> dict[str, Any]:
+    """Load only environment-provided settings without default values."""
+    return EnvSettingsSource(Config)()
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge config dictionaries with override precedence."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged

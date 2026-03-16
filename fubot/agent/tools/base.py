@@ -1,7 +1,260 @@
 """Base class for agent tools."""
 
+import hashlib
+import json
+import uuid
 from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, Mapping
+
+
+def _new_execution_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def build_tool_idempotency_key(
+    trace_id: str,
+    tool_name: str,
+    occurrence_index: int,
+    params: Mapping[str, Any],
+) -> str:
+    payload = json.dumps(
+        params,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    digest = hashlib.sha256(
+        f"{trace_id}:{tool_name}:{occurrence_index}:{payload}".encode("utf-8")
+    ).hexdigest()
+    return digest[:24]
+
+
+def _validate_non_empty_str(value: Any, *, field_name: str, error_prefix: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{error_prefix}: {field_name} must be a non-empty string")
+    return value
+
+
+def _validate_optional_str(value: Any, *, field_name: str, error_prefix: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{error_prefix}: {field_name} must be a string when provided")
+    return value
+
+
+def _validate_attempt_index(value: Any, *, error_prefix: str) -> int:
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(f"{error_prefix}: attempt_index must be a non-negative integer")
+    return value
+
+
+@dataclass(frozen=True)
+class ToolExecutionLineage:
+    """Stable task-level lineage used to derive tool execution contexts."""
+
+    trace_id: str
+    root_execution_id: str
+    route_trace_id: str
+    attempt_index: int
+    parent_execution_id: str | None = None
+
+    @classmethod
+    def create_root(
+        cls,
+        *,
+        route_trace_id: str,
+        attempt_index: int,
+        trace_id: str | None = None,
+        root_execution_id: str | None = None,
+        parent_execution_id: str | None = None,
+    ) -> "ToolExecutionLineage":
+        return cls(
+            trace_id=trace_id or _new_execution_id(),
+            root_execution_id=root_execution_id or _new_execution_id(),
+            route_trace_id=route_trace_id,
+            attempt_index=attempt_index,
+            parent_execution_id=parent_execution_id,
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ToolExecutionLineage":
+        error_prefix = "Invalid tool_execution_lineage metadata"
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"{error_prefix}: payload must be a mapping")
+        return cls(
+            trace_id=_validate_non_empty_str(
+                payload.get("trace_id"),
+                field_name="trace_id",
+                error_prefix=error_prefix,
+            ),
+            root_execution_id=_validate_non_empty_str(
+                payload.get("root_execution_id"),
+                field_name="root_execution_id",
+                error_prefix=error_prefix,
+            ),
+            route_trace_id=_validate_non_empty_str(
+                payload.get("route_trace_id"),
+                field_name="route_trace_id",
+                error_prefix=error_prefix,
+            ),
+            attempt_index=_validate_attempt_index(
+                payload.get("attempt_index"),
+                error_prefix=error_prefix,
+            ),
+            parent_execution_id=_validate_optional_str(
+                payload.get("parent_execution_id"),
+                field_name="parent_execution_id",
+                error_prefix=error_prefix,
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trace_id": self.trace_id,
+            "root_execution_id": self.root_execution_id,
+            "route_trace_id": self.route_trace_id,
+            "attempt_index": self.attempt_index,
+            "parent_execution_id": self.parent_execution_id,
+        }
+
+    def for_route(self, *, route_trace_id: str, attempt_index: int) -> "ToolExecutionLineage":
+        return replace(
+            self,
+            route_trace_id=route_trace_id,
+            attempt_index=attempt_index,
+        )
+
+    def derive_child(
+        self,
+        *,
+        route_trace_id: str,
+        attempt_index: int,
+        parent_execution_id: str | None = None,
+        trace_id: str | None = None,
+        root_execution_id: str | None = None,
+    ) -> "ToolExecutionLineage":
+        return ToolExecutionLineage.create_root(
+            trace_id=trace_id,
+            root_execution_id=root_execution_id,
+            route_trace_id=route_trace_id,
+            attempt_index=attempt_index,
+            parent_execution_id=parent_execution_id if parent_execution_id is not None else self.root_execution_id,
+        )
+
+    def derive_execution(
+        self,
+        *,
+        idempotency_key: str,
+        execution_id: str | None = None,
+        is_replay: bool = False,
+        parent_execution_id: str | None = None,
+    ) -> "ToolExecutionContext":
+        return ToolExecutionContext(
+            execution_id=execution_id or _new_execution_id(),
+            trace_id=self.trace_id,
+            route_trace_id=self.route_trace_id,
+            parent_execution_id=self.root_execution_id if parent_execution_id is None else parent_execution_id,
+            attempt_index=self.attempt_index,
+            idempotency_key=idempotency_key,
+            is_replay=is_replay,
+        )
+
+    def log_fields(self) -> dict[str, str | int]:
+        return {
+            "trace_id": self.trace_id,
+            "root_execution_id": self.root_execution_id,
+            "route_trace_id": self.route_trace_id,
+            "parent_execution_id": self.parent_execution_id or "-",
+            "attempt_index": self.attempt_index,
+        }
+
+
+@dataclass(frozen=True)
+class ToolExecutionContext:
+    """Execution lineage for one logical tool invocation."""
+
+    execution_id: str
+    trace_id: str
+    route_trace_id: str
+    parent_execution_id: str | None
+    attempt_index: int
+    idempotency_key: str
+    is_replay: bool = False
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ToolExecutionContext":
+        error_prefix = "Invalid tool_execution_context metadata"
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"{error_prefix}: payload must be a mapping")
+        return cls(
+            execution_id=_validate_non_empty_str(
+                payload.get("execution_id"),
+                field_name="execution_id",
+                error_prefix=error_prefix,
+            ),
+            trace_id=_validate_non_empty_str(
+                payload.get("trace_id"),
+                field_name="trace_id",
+                error_prefix=error_prefix,
+            ),
+            route_trace_id=_validate_non_empty_str(
+                payload.get("route_trace_id"),
+                field_name="route_trace_id",
+                error_prefix=error_prefix,
+            ),
+            parent_execution_id=_validate_optional_str(
+                payload.get("parent_execution_id"),
+                field_name="parent_execution_id",
+                error_prefix=error_prefix,
+            ),
+            attempt_index=_validate_attempt_index(
+                payload.get("attempt_index"),
+                error_prefix=error_prefix,
+            ),
+            idempotency_key=_validate_non_empty_str(
+                payload.get("idempotency_key"),
+                field_name="idempotency_key",
+                error_prefix=error_prefix,
+            ),
+            is_replay=bool(payload.get("is_replay", False)),
+        )
+
+    @property
+    def idempotency_key_prefix(self) -> str:
+        return self.idempotency_key[:12]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "execution_id": self.execution_id,
+            "trace_id": self.trace_id,
+            "route_trace_id": self.route_trace_id,
+            "parent_execution_id": self.parent_execution_id,
+            "attempt_index": self.attempt_index,
+            "idempotency_key": self.idempotency_key,
+            "is_replay": self.is_replay,
+        }
+
+    def as_replay(self, *, parent_execution_id: str | None = None) -> "ToolExecutionContext":
+        """Mark the invocation as a replay while preserving lineage metadata."""
+        return replace(
+            self,
+            is_replay=True,
+            parent_execution_id=parent_execution_id if parent_execution_id is not None else self.parent_execution_id,
+        )
+
+    def log_fields(self) -> dict[str, str | int | bool]:
+        return {
+            "execution_id": self.execution_id,
+            "trace_id": self.trace_id,
+            "route_trace_id": self.route_trace_id,
+            "parent_execution_id": self.parent_execution_id or "-",
+            "attempt_index": self.attempt_index,
+            "idempotency_key": self.idempotency_key_prefix,
+            "is_replay": self.is_replay,
+        }
 
 
 class Tool(ABC):
@@ -168,6 +421,11 @@ class Tool(ABC):
                     self._validate(item, schema["items"], f"{path}[{i}]" if path else f"[{i}]")
                 )
         return errors
+
+    def execution_mode(self, params: Mapping[str, Any]) -> str:
+        """Classify a tool call as read-only or side-effecting for replay guards."""
+        _ = params
+        return "side_effect"
 
     def to_schema(self) -> dict[str, Any]:
         """Convert tool to OpenAI function schema format."""

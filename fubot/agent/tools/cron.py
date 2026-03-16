@@ -38,6 +38,9 @@ class CronTool(Tool):
     def description(self) -> str:
         return "Schedule reminders and recurring tasks. Actions: add, list, remove."
 
+    def execution_mode(self, params: dict[str, Any]) -> str:
+        return "read_only" if params.get("action") == "list" else "side_effect"
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {

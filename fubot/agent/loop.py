@@ -16,6 +16,11 @@ from loguru import logger
 from fubot.agent.context import ContextBuilder
 from fubot.agent.memory import MemoryConsolidator
 from fubot.agent.subagent import SubagentManager
+from fubot.agent.tools.base import (
+    ToolExecutionContext,
+    ToolExecutionLineage,
+    build_tool_idempotency_key,
+)
 from fubot.agent.tools.cron import CronTool
 from fubot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from fubot.agent.tools.message import MessageTool
@@ -26,10 +31,12 @@ from fubot.agent.tools.web import WebFetchTool, WebSearchTool
 from fubot.bus.events import InboundMessage, OutboundMessage
 from fubot.bus.queue import MessageBus
 from fubot.config.schema import AgentProfile, Config
-from fubot.orchestrator.models import ExecutionLogRecord
+from fubot.orchestrator.models import ExecutionLogRecord, RouteDecision
+from fubot.orchestrator.router import ProviderExecutionError, classify_provider_error
 from fubot.orchestrator.runtime import CoordinatorRuntime, ExecutorResult
 from fubot.orchestrator.store import WorkflowStore
 from fubot.providers.base import LLMProvider
+from fubot.providers.factory import build_provider_for_route
 from fubot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
@@ -95,6 +102,11 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        self.workflow_store = WorkflowStore(
+            workspace=workspace,
+            workflow_dir_name=self.config.storage.workflow_dir,
+            health_file=self.config.storage.health_cache_file,
+        )
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -104,6 +116,10 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            config=self.config,
+            default_provider_name=self.config.resolve_provider(model=self.model).provider_name,
+            allow_legacy_route_fallback=not self.config.orchestration.enabled,
+            workflow_store=self.workflow_store,
         )
 
         self._running = False
@@ -112,12 +128,8 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._tool_execution_lineages: dict[str, dict[str, Any]] = {}
         self._processing_lock = asyncio.Lock()
-        self.workflow_store = WorkflowStore(
-            workspace=workspace,
-            workflow_dir_name=self.config.storage.workflow_dir,
-            health_file=self.config.storage.health_cache_file,
-        )
         self.coordinator = CoordinatorRuntime(self.config, self.workflow_store)
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
@@ -138,9 +150,10 @@ class AgentLoop:
         self,
         tool_allowlist: list[str] | None = None,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
+        replay_cache: dict[str, dict[str, Any]] | None = None,
     ) -> ToolRegistry:
         """Create an isolated registry so concurrent executors do not share tool state."""
-        registry = ToolRegistry()
+        registry = ToolRegistry(replay_cache=replay_cache)
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         inherited_send_callback = send_callback
         base_message_tool = self.tools.get("message")
@@ -207,13 +220,19 @@ class AgentLoop:
         chat_id: str,
         message_id: str | None = None,
         registry: ToolRegistry | None = None,
+        route_decision: RouteDecision | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         active_registry = registry or self.tools
         for name in ("message", "spawn", "cron"):
             if tool := active_registry.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    if name == "message":
+                        tool.set_context(channel, chat_id, message_id)
+                    elif name == "spawn":
+                        tool.set_context(channel, chat_id, route_decision)
+                    else:
+                        tool.set_context(channel, chat_id)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -233,27 +252,94 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _tool_execution_lineage_key(workflow_id: str, task_id: str) -> str:
+        return f"{workflow_id}:{task_id}"
+
+    def _get_tool_execution_lineage(
+        self,
+        workflow_id: str,
+        task_id: str,
+        *,
+        route_decision: RouteDecision,
+    ) -> dict[str, Any]:
+        key = self._tool_execution_lineage_key(workflow_id, task_id)
+        lineage = self._tool_execution_lineages.get(key)
+        if lineage is None:
+            # This lineage is scoped to the current process and task run. It is
+            # shared across fallback attempts but is not yet persisted across restarts.
+            lineage = {
+                "lineage": ToolExecutionLineage.create_root(
+                    route_trace_id=route_decision.trace_id,
+                    attempt_index=route_decision.attempt_index,
+                ),
+                "replay_cache": {},
+            }
+            self._tool_execution_lineages[key] = lineage
+        return lineage
+
+    def _cleanup_tool_execution_lineage(self, workflow_id: str, task_id: str) -> None:
+        self._tool_execution_lineages.pop(self._tool_execution_lineage_key(workflow_id, task_id), None)
+
+    def _make_tool_context_builder(
+        self,
+        *,
+        lineage: ToolExecutionLineage,
+    ) -> Callable[[str, dict[str, Any], int], ToolExecutionContext]:
+        def _build(tool_name: str, params: dict[str, Any], occurrence_index: int) -> ToolExecutionContext:
+            return lineage.derive_execution(
+                idempotency_key=build_tool_idempotency_key(
+                    lineage.trace_id,
+                    tool_name,
+                    occurrence_index,
+                    params,
+                ),
+            )
+
+        return _build
+
+    @staticmethod
+    def _allow_default_provider_for_legacy_route(
+        route_decision: RouteDecision,
+        default_model: str,
+    ) -> bool:
+        """Keep single-provider root flows working without swallowing explicit routes."""
+        if route_decision.provider is not None:
+            return False
+        if route_decision.parent_trace_id is not None or route_decision.attempt_index != 0:
+            return False
+        if route_decision.model != default_model:
+            return False
+        if route_decision.fallback_chain and route_decision.fallback_chain != [route_decision.model]:
+            return False
+        return True
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
         registry: ToolRegistry | None = None,
         model: str | None = None,
+        provider: LLMProvider | None = None,
+        raise_on_provider_error: bool = False,
+        tool_context_builder: Callable[[str, dict[str, Any], int], ToolExecutionContext] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        tool_occurrences: dict[str, int] = {}
         active_registry = registry or self.tools
         active_model = model or self.model
+        active_provider = provider or self.provider
 
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = active_registry.get_definitions()
 
-            response = await self.provider.chat_with_retry(
+            response = await active_provider.chat_with_retry(
                 messages=messages,
                 tools=tool_defs,
                 model=active_model,
@@ -280,7 +366,25 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await active_registry.execute(tool_call.name, tool_call.arguments)
+                    fingerprint = json.dumps(
+                        {"name": tool_call.name, "arguments": tool_call.arguments},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                    occurrence_index = tool_occurrences.get(fingerprint, 0)
+                    tool_occurrences[fingerprint] = occurrence_index + 1
+                    tool_context = (
+                        tool_context_builder(tool_call.name, tool_call.arguments, occurrence_index)
+                        if tool_context_builder is not None
+                        else None
+                    )
+                    result = await active_registry.execute(
+                        tool_call.name,
+                        tool_call.arguments,
+                        execution_context=tool_context,
+                    )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -289,6 +393,11 @@ class AgentLoop:
                 # Don't persist error responses to session history — they can
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
+                    if raise_on_provider_error:
+                        raise ProviderExecutionError(
+                            clean or "Provider execution failed.",
+                            error_kind=classify_provider_error(clean or "") or "provider_error",
+                        )
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
@@ -371,6 +480,7 @@ class AgentLoop:
         self,
         profile: AgentProfile,
         task: Any,
+        route_decision: RouteDecision,
         workflow_id: str,
         session_key: str,
         channel: str,
@@ -382,8 +492,16 @@ class AgentLoop:
         """Run one executor profile against the current session history."""
         session = self.sessions.get_or_create(session_key)
         history = session.get_history(max_messages=0)
-        registry = self._make_tool_registry(tool_allowlist=profile.tool_allowlist)
-        self._set_tool_context(channel, chat_id, None, registry=registry)
+        tool_lineage = self._get_tool_execution_lineage(
+            workflow_id,
+            task.id,
+            route_decision=route_decision,
+        )
+        registry = self._make_tool_registry(
+            tool_allowlist=profile.tool_allowlist,
+            replay_cache=tool_lineage["replay_cache"],
+        )
+        self._set_tool_context(channel, chat_id, None, registry=registry, route_decision=route_decision)
         message_tool = registry.get("message")
         if isinstance(message_tool, MessageTool):
             message_tool.start_turn()
@@ -402,8 +520,32 @@ class AgentLoop:
             task.title,
             shared_board,
         )
-
-        decision = self.coordinator.router.choose_model(profile, task.kind, task.metadata.get("input", ""))
+        route_fields = route_decision.log_fields()
+        logger.debug(
+            "Executor using route route_kind={} trace_id={} parent_trace_id={} previous_attempt_trace_id={} agent={} provider={} model={} attempt={}",
+            route_fields["route_kind"],
+            route_fields["trace_id"],
+            route_fields["parent_trace_id"],
+            route_fields["previous_attempt_trace_id"],
+            profile.id,
+            route_fields["provider"],
+            route_fields["model"],
+            route_fields["attempt_index"],
+        )
+        active_lineage = tool_lineage["lineage"].for_route(
+            route_trace_id=route_decision.trace_id,
+            attempt_index=route_decision.attempt_index,
+        )
+        routed_provider = build_provider_for_route(
+            self.config,
+            route_decision,
+            default_provider=self.provider,
+            default_model=self.model,
+            allow_default_provider=self._allow_default_provider_for_legacy_route(
+                route_decision,
+                self.model,
+            ),
+        )
 
         async def _wrapped_progress(content: str, *, tool_hint: bool = False) -> None:
             if on_progress:
@@ -413,7 +555,10 @@ class AgentLoop:
             initial_messages,
             on_progress=_wrapped_progress,
             registry=registry,
-            model=decision.model,
+            model=route_decision.model,
+            provider=routed_provider,
+            raise_on_provider_error=True,
+            tool_context_builder=self._make_tool_context_builder(lineage=active_lineage),
         )
         if final_content is None:
             final_content = "Executor finished without a final response."
@@ -422,7 +567,7 @@ class AgentLoop:
             profile=profile,
             task=task,
             content=final_content,
-            route=decision.to_dict(),
+            route=route_decision.to_dict(),
             all_messages=all_messages,
             tools_used=tools_used,
             sent_direct_message=bool(isinstance(message_tool, MessageTool) and message_tool._sent_in_turn),
@@ -533,13 +678,77 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            route_payload = msg.metadata.get("route_decision")
+            route_decision = RouteDecision.from_dict(route_payload) if isinstance(route_payload, dict) else None
+            lineage_payload = msg.metadata.get("tool_execution_lineage")
+            tool_lineage = (
+                ToolExecutionLineage.from_dict(lineage_payload)
+                if isinstance(lineage_payload, dict)
+                else (
+                    ToolExecutionLineage.create_root(
+                        route_trace_id=route_decision.trace_id,
+                        attempt_index=route_decision.attempt_index,
+                    )
+                    if route_decision is not None
+                    else None
+                )
+            )
+            registry = self._make_tool_registry(
+                replay_cache={},
+            )
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                registry=registry,
+                route_decision=route_decision,
+            )
             history = session.get_history(max_messages=0)
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            routed_provider = None
+            routed_model = None
+            if route_decision is not None:
+                route_fields = route_decision.log_fields()
+                logger.debug(
+                    "System execution using route route_kind={} trace_id={} parent_trace_id={} previous_attempt_trace_id={} provider={} model={} attempt={}",
+                    route_fields["route_kind"],
+                    route_fields["trace_id"],
+                    route_fields["parent_trace_id"],
+                    route_fields["previous_attempt_trace_id"],
+                    route_fields["provider"],
+                    route_fields["model"],
+                    route_fields["attempt_index"],
+                )
+                routed_provider = build_provider_for_route(
+                    self.config,
+                    route_decision,
+                    default_provider=self.provider,
+                    default_model=self.model,
+                    allow_default_provider=self._allow_default_provider_for_legacy_route(
+                        route_decision,
+                        self.model,
+                    ),
+                )
+                routed_model = route_decision.model
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages,
+                registry=registry,
+                model=routed_model,
+                provider=routed_provider,
+                tool_context_builder=(
+                    self._make_tool_context_builder(
+                        lineage=tool_lineage.for_route(
+                            route_trace_id=route_decision.trace_id,
+                            attempt_index=route_decision.attempt_index,
+                        )
+                    )
+                    if tool_lineage is not None and route_decision is not None
+                    else None
+                ),
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
@@ -623,6 +832,7 @@ class AgentLoop:
                     msg.chat_id,
                     local_progress=on_progress,
                 ),
+                cleanup_task_lineage=self._cleanup_tool_execution_lineage,
             )
             msg.metadata.setdefault("workflow_id", workflow.id)
             if len(results) == 1:
